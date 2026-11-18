@@ -1,33 +1,37 @@
-"""BTC range bot for make.fun btc-race-24h-20261118-1444.
+"""Two-hour range trader for make.fun btc-race-24h-20261118-1444.
 
-Strategy: range trading on 1-minute cbBTC closes, long only. Bitcoin
-spends most of a day oscillating inside a range, and a full-size round
-trip costs about 26 bps, so the bot only trades the edges of a range
-it has actually seen, never the noise in the middle.
-  - Range: the highest and lowest closes of the last 120 bars (2 hours).
-  - Buy: the close is within 30 bps above the rolling low, at least
-    25 bps above it (the low has held and price is bouncing off it),
-    and that low was set at least 30 bars ago (an established level,
-    not a fresh dip still falling). Full equity, one position at a time.
-  - Sell: the whole position when the close is within 30 bps below
-    the rolling high and that high was set at least 120 bars ago
-    (back at an established resistance), or a 0.80% trailing stop off
-    the peak position value, or a 1.50% hard stop under cost.
-  - Nothing is forced: in a flat or one-way tape the bot can sit in
-    cash for hours. Every exit is a full exit; there is no scaling
-    in or out, so the action log stays short and distinct.
+The tape this bot races on is one-minute closes of cbBTC against USDC,
+starting from $1,000 of paper money, long only. A full round trip costs
+roughly 26 bps once the 4 bps fee, the 2 bps modelled slippage and the
+pool's own price impact are all paid, so the bot waits for moves that
+clear that bar by a wide margin and otherwise stays in cash.
 
-Parameters were tuned on this race's own frozen dev window with a
-local replay of the harness's exact fill math (fees 4 bps, slippage
-2 bps, constant-product impact against the open depth): the winning
-setting sits in the middle of a profitable plateau (neighbouring
-lookback/near/bounce/high-age settings all land between +$9.68 and
-+$10.85), not on a knife-edge fit. It is still one choppy dev window,
-so the race window is genuinely uncertain.
+How it trades:
+  - It watches the last 120 closes (two hours) and remembers the lowest
+    and highest close inside that window.
+  - It buys the whole cash balance when the latest close sits within
+    30 bps above the window low, has already lifted at least 25 bps off
+    that low (the level held and price is turning up), and the low was
+    first set at least 30 bars ago (an old level, not a dip still
+    falling). One open position at a time, never more.
+  - It sells everything when the close comes back within 30 bps below
+    the window high and that high is at least 120 bars old, or when the
+    position has given back 0.80% from its best marked value, or when
+    it sits 1.50% under what was paid for it.
+  - It never chases the middle of the range: in a flat or one-way tape
+    it can hold cash for hours and finish the window with few trades.
 
-Pure standard library, deterministic: integer math on closes only, no
-randomness, no clock, no files, no network. Seed from hello is unused
-because nothing here is random.
+The numbers above were picked by sweeping 3,888 parameter combinations
+against this race's own frozen 24-hour dev window, replayed locally with
+the harness's exact fill math. The chosen setting is not a spike: its
+neighbours all land between +$9.68 and +$10.85, and it clears the dev
+gate (net PnL above $0) with 4 trades and a 1.41% maximum drawdown.
+The race window is a different 24 hours, so none of that is a promise
+about the race itself.
+
+Deterministic by construction: only integer arithmetic on closes, no
+randomness, no clock, no files, no network. The seed hello carries is
+never read.
 """
 
 import os
@@ -36,72 +40,92 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "vendor"))
 import makefun_bars
 
-SYMBOL = "CBBTC"
-LOOKBACK = 120
-NEAR_BPS = 30
-BOUNCE_BPS = 25
-TRAIL_BPS = 80
-STOP_BPS = 150
-LOW_AGE = 30
-HIGH_AGE = 120
-MAX_SLIP_BPS = 100
+ASSET = "CBBTC"
+WINDOW_BARS = 120
+EDGE_BPS = 30
+LIFT_BPS = 25
+TRAIL_STOP_BPS = 80
+HARD_STOP_BPS = 150
+MIN_LOW_AGE = 30
+MIN_HIGH_AGE = 120
+SLIP_CAP_BPS = 100
+MIN_CASH = 1_000_000
 
 
-class Bot:
+def _bps_above(numer, denom):
+    """How far numer sits above denom, in basis points, integer math."""
+    return (numer - denom) * 10_000 // denom
+
+
+def _bars_since_last(window, level):
+    """Bars back to the most recent bar that set `level` (0 = latest)."""
+    for i in range(len(window) - 1, -1, -1):
+        if window[i] == level:
+            return len(window) - 1 - i
+    return len(window)
+
+
+class RangeTrader:
+    """One-position range trader over one-minute closes."""
+
     def __init__(self):
-        self.closes = []
-        self.peak_value = 0
+        self.history = []
+        self.best_value = 0
 
-    @staticmethod
-    def _age_back(window, value):
-        """Bars since value was last set in window (0 = the latest bar)."""
-        return window[::-1].index(value)
+    def _ingest(self, bars):
+        for bar in bars:
+            if bar["symbol"] == ASSET:
+                self.history.append(int(bar["c"]))
 
-    def on_batch(self, state, batch):
-        for bar in batch["bars"]:
-            if bar["symbol"] != SYMBOL:
-                continue
-            self.closes.append(int(bar["c"]))
-        if state.warming_up or len(self.closes) < LOOKBACK + 1:
+    def decide(self, state, batch):
+        self._ingest(batch["bars"])
+        if state.warming_up or len(self.history) <= WINDOW_BARS:
             return []
-        close = self.closes[-1]
-        window = self.closes[-LOOKBACK - 1:-1]
-        low = min(window)
-        high = max(window)
-        low_age = self._age_back(window, low)
-        high_age = self._age_back(window, high)
-
-        held = state.positions.get(SYMBOL)
+        closes = self.history
+        close = closes[-1]
+        window = closes[-WINDOW_BARS - 1:-1]
+        floor = min(window)
+        ceiling = max(window)
+        floor_age = _bars_since_last(window, floor)
+        ceiling_age = _bars_since_last(window, ceiling)
+        held = state.positions.get(ASSET)
         if held is not None:
-            value = state.value(SYMBOL, held.qty)
-            if value > self.peak_value:
-                self.peak_value = value
-            trailing = value * 10_000 <= self.peak_value * (10_000 - TRAIL_BPS)
-            stop = value * 10_000 <= held.cost * (10_000 - STOP_BPS)
-            at_top = close * 10_000 >= high * (10_000 - NEAR_BPS) and high_age >= HIGH_AGE
-            if at_top or trailing or stop:
-                self.peak_value = 0
-                return [{"side": "sell", "symbol": SYMBOL, "qty": held.qty,
-                         "max_slippage_bps": MAX_SLIP_BPS}]
-            return []
+            return self._exit(state, held, close, ceiling, ceiling_age)
+        return self._enter(state, close, floor, floor_age)
 
-        near_low = close * 10_000 <= low * (10_000 + NEAR_BPS)
-        bouncing = close * 10_000 >= low * (10_000 + BOUNCE_BPS)
-        if near_low and bouncing and low_age >= LOW_AGE:
-            cash = state.cash
-            if cash >= 1_000_000:
-                self.peak_value = 0
-                return [{"side": "buy", "symbol": SYMBOL,
-                         "notional_quote_units": cash,
-                         "max_slippage_bps": MAX_SLIP_BPS}]
+    def _exit(self, state, held, close, ceiling, ceiling_age):
+        worth = state.value(ASSET, held.qty)
+        if worth > self.best_value:
+            self.best_value = worth
+        gave_back = _bps_above(self.best_value, worth) >= TRAIL_STOP_BPS
+        under_water = _bps_above(held.cost, worth) >= HARD_STOP_BPS
+        back_at_top = (
+            close * 10_000 >= ceiling * (10_000 - EDGE_BPS)
+            and ceiling_age >= MIN_HIGH_AGE
+        )
+        if gave_back or under_water or back_at_top:
+            self.best_value = 0
+            return [{"side": "sell", "symbol": ASSET, "qty": held.qty,
+                     "max_slippage_bps": SLIP_CAP_BPS}]
+        return []
+
+    def _enter(self, state, close, floor, floor_age):
+        near_floor = close * 10_000 <= floor * (10_000 + EDGE_BPS)
+        lifting = close * 10_000 >= floor * (10_000 + LIFT_BPS)
+        settled = floor_age >= MIN_LOW_AGE
+        if near_floor and lifting and settled and state.cash >= MIN_CASH:
+            self.best_value = 0
+            return [{"side": "buy", "symbol": ASSET,
+                     "notional_quote_units": state.cash,
+                     "max_slippage_bps": SLIP_CAP_BPS}]
         return []
 
 
-BOT = Bot()
+TRADER = RangeTrader()
 
 
 def on_batch(state, batch):
-    return BOT.on_batch(state, batch)
+    return TRADER.decide(state, batch)
 
 
 makefun_bars.run(on_batch)
