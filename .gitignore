@@ -1,2 +1,3 @@
+# bytecode and caches
 __pycache__/
-*.pyc
+*.py[cod]
